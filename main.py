@@ -1,6 +1,7 @@
+import random
 from typing import NamedTuple
-
 import numpy as np
+import csv
 
 
 class Neuron:
@@ -42,7 +43,9 @@ class Softmax:
         # subtract max for numerical stability before exponentiating
         e = np.exp(x - np.max(x))
         self.last_output = e / e.sum()
-        self.last_derivative = self.last_output * (1 - self.last_output)  # Note: This is not the full Jacobian, just the diagonal
+        # Softmax derivative is not implemented because full Jacobian is complex.
+        # Use CrossEntropy loss with Softmax for proper backpropagation.
+        # self.last_derivative = self.last_output * (1 - self.last_output)  # Note: This is not the full Jacobian, just the diagonal
         return self.last_output
 
 
@@ -103,10 +106,17 @@ class Sequence:
 
 
 class Layer:
-    def __init__(self, n_in: int, n_out: int, seed: int):
+    def __init__(self, n_in: int, n_out: int, seed: int, Activation: type):
         rng = np.random.default_rng(seed)
+        if Activation == ReLU:
+            scale = np.sqrt(2.0 / n_in)   # He
+        elif Activation in (Sigmoid, Softmax, Identity):
+            scale = np.sqrt(1.0 / n_in)   # Xavier
+        else:
+            raise ValueError(f"No initialization strategy defined for {Activation}")
+
         self.neurons = [
-            Neuron(weights=rng.standard_normal(n_in), bias=rng.standard_normal())
+            Neuron(weights=rng.standard_normal(n_in) * scale, bias=0.0)
             for _ in range(n_out)
         ]
         self.last_output: np.ndarray | None = None
@@ -139,18 +149,19 @@ class LayerActivationPair(NamedTuple):
 class NeuralNet:
     def __init__(
         self,
-        layers: list[int],
         seed: int,
+        layer_sizes: list[int],
         hidden_activation: type = ReLU,
         output_activation: type = Softmax,
     ):
         steps = []
         pairs = []
-        for i, (n_in, n_out) in enumerate(zip([layers[0]] + layers[:-1], layers)):
+        for i, (n_in, n_out) in enumerate(zip(layer_sizes[0:-1], layer_sizes[1:])):
             print(f"Creating layer {i} with {n_in} inputs and {n_out} outputs")
-            layer = Layer(n_in=n_in, n_out=n_out, seed=seed + i)
+            Activation = hidden_activation if i < len(layer_sizes) - 2 else output_activation
+            layer = Layer(n_in=n_in, n_out=n_out, seed=seed + i, Activation = Activation)
+            activation = Activation()
             steps.append(layer)
-            activation = hidden_activation() if i < len(layers) - 2 else output_activation()
             steps.append(activation)
             pairs.append(LayerActivationPair(layer, activation))
         self.sequence = Sequence(steps)
@@ -164,13 +175,16 @@ class NeuralNet:
         return self.pairs
 
     
-def train(dnn: NeuralNet, training_data: list[tuple[list[float], float]], Loss, num_epochs: int, learning_rate: float = 0.1, target_loss: float = 0.001):
+def train(dnn: NeuralNet, training_data: list[tuple[list[float], float | list[float]]], Loss, seed: int, num_epochs: int = 20000, learning_rate: float = 0.1, target_loss: float = 0.001):
+    rng = random.Random(seed)
     for epoch in range(num_epochs):
         epoch_loss = 0.0
-        for x, y in training_data:
+        epoch_data = list(training_data)
+        rng.shuffle(epoch_data)
+        for x, y in epoch_data:
             x_array = np.array(x)
             y_pred = dnn.forward(x_array)
-            y_true = np.array([y])
+            y_true = np.array(y if isinstance(y, list) else [y])
             loss = Loss().loss(y_pred, y_true)
             epoch_loss += loss
             pairs = dnn.get_layer_activation_pairs()
@@ -180,7 +194,10 @@ def train(dnn: NeuralNet, training_data: list[tuple[list[float], float]], Loss, 
                 i = len(pairs) - 1 - i_reverse
                 if i_reverse == 0:
                     # Last layer
-                    delta = Loss().derivative(y_pred, y_true) * activation.last_derivative
+                    if isinstance(activation, Softmax) and Loss == CrossEntropy:
+                        delta = y_pred - y_true
+                    else:
+                        delta = Loss().derivative(y_pred, y_true) * activation.last_derivative
                 else:
                     next_weights = pairs[i + 1].layer.get_weights()
                     delta = (next_weights.T @ deltas[i + 1]) * activation.last_derivative
@@ -203,7 +220,7 @@ def train(dnn: NeuralNet, training_data: list[tuple[list[float], float]], Loss, 
             break
 
 
-def check_accuracy(dnn: NeuralNet, test_data: list[tuple[list[float], float]], threshold=0.5):
+def check_accuracy_XOR(dnn: NeuralNet, test_data: list[tuple[list[float], float | list[float]]], threshold=0.5):
     def predict_class(y_pred):
         return (y_pred >= threshold).astype(int)
     for x, y in test_data:
@@ -215,6 +232,19 @@ def check_accuracy(dnn: NeuralNet, test_data: list[tuple[list[float], float]], t
     return accuracy[0]
 
 
+def check_accuracy(dnn: NeuralNet, test_data: list[tuple[list[float], float | list[float]]]):
+    correct = 0
+    for x, y in test_data:
+        x_array = np.array(x)
+        y_pred = dnn.forward(x_array)
+        predicted_class = np.argmax(y_pred)
+        true_class = np.argmax(y) if isinstance(y, list) else int(y)
+        is_correct = predicted_class == true_class
+        correct += is_correct
+    accuracy = correct / len(test_data)
+    return accuracy
+
+
 def print_final_weights_and_biases(dnn: NeuralNet):
     for i, (layer, activation) in enumerate(dnn.get_layer_activation_pairs()):
         print(f"Layer {i} weights:\n{layer.get_weights()}")
@@ -222,16 +252,58 @@ def print_final_weights_and_biases(dnn: NeuralNet):
 
 
 def testXOR(seed: int):
-    layers = [2, 1]
-    dnn = NeuralNet(layers=layers, seed=seed, hidden_activation=Sigmoid, output_activation=Sigmoid)
+    dnn = NeuralNet(
+        seed=seed,
+        layer_sizes=[2, 2, 1],
+        hidden_activation=Sigmoid,
+        output_activation=Sigmoid,
+    )
     Loss = MSE;
     training_data = [([0, 0], 0), ([0, 1], 1), ([1, 0], 1), ([1, 1], 0)]
-    train(dnn, training_data, Loss, 20000)
-    accuracy = check_accuracy(dnn, training_data)
+    train(dnn, training_data, Loss, seed)
+    accuracy = check_accuracy_XOR(dnn, training_data)
     print(f"Final accuracy on XOR problem: {accuracy * 100:.2f}%")
     print_final_weights_and_biases(dnn)
 
 
-if __name__ == "__main__":
-    testXOR(seed=42)
+def testIris(seed: int):
+    # Load the Iris dataset from its CSV file (headers are sepal_length,sepal_width,petal_length,petal_width,species)
+    iris_data = []
+    with open("iris.csv", "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            iris_data.append(row)
+    # Normalize each feature to mean 0, std 1
+    for feature in ["sepal_length", "sepal_width", "petal_length", "petal_width"]:
+        values = np.array([float(row[feature]) for row in iris_data])
+        mean = np.mean(values)
+        std = np.std(values)
+        for row in iris_data:
+            row[feature] = (float(row[feature]) - mean) / std
 
+    dnn = NeuralNet(
+        seed=seed,
+        layer_sizes=[4, 8, 3],
+        # layer_sizes=[4, 6, 6, 3],
+        hidden_activation=ReLU,
+        output_activation=Softmax
+    )
+    Loss = CrossEntropy;
+    # Training data is a list of tuples where each tuple contains a list of 4 floats (the features) and a list of 3 floats (the one-hot encoded target)
+    training_data = [
+        (
+            [float(row["sepal_length"]), float(row["sepal_width"]), float(row["petal_length"]), float(row["petal_width"])],
+            [1.0 if row["species"] == "setosa" else 0.0,
+             1.0 if row["species"] == "versicolor" else 0.0,
+             1.0 if row["species"] == "virginica" else 0.0]
+        )
+        for row in iris_data
+    ]
+    train(dnn, training_data, Loss, seed, learning_rate=0.01)
+    accuracy = check_accuracy(dnn, training_data)
+    print(f"Final accuracy on Iris problem: {accuracy * 100:.2f}%")
+    # print_final_weights_and_biases(dnn)
+
+
+if __name__ == "__main__":
+    testIris(seed=42)

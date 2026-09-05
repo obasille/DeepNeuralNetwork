@@ -18,50 +18,43 @@ class ReLU:
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         self.last_output = np.maximum(0, x)
+        self.last_derivative = (x > 0).astype(float)
         return self.last_output
-
-    def derivative(self, x: np.ndarray) -> np.ndarray:
-        return (x > 0).astype(float)
 
 
 class Sigmoid:
     def __init__(self):
         self.last_output: np.ndarray | None = None
+        self.last_derivative: np.ndarray | None = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         self.last_output = 1 / (1 + np.exp(-x))
+        self.last_derivative = self.last_output * (1 - self.last_output)
         return self.last_output
-
-    def derivative(self, x: np.ndarray) -> np.ndarray:
-        sig = self.forward(x)
-        return sig * (1 - sig)
 
 
 class Softmax:
     def __init__(self):
         self.last_output: np.ndarray | None = None
+        self.last_derivative: np.ndarray | None = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         # subtract max for numerical stability before exponentiating
         e = np.exp(x - np.max(x))
         self.last_output = e / e.sum()
+        self.last_derivative = self.last_output * (1 - self.last_output)  # Note: This is not the full Jacobian, just the diagonal
         return self.last_output
-
-    def derivative(self, x: np.ndarray) -> np.ndarray:
-        s = self.forward(x)
-        return s * (1 - s)  # Note: This is not the full Jacobian, just the diagonal
 
 
 class Identity:
     def __init__(self):
         self.last_output: np.ndarray | None = None
+        self.last_derivative: np.ndarray | None = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         self.last_output = x
+        self.last_derivative = np.ones_like(x)
         return self.last_output
-
-    def derivative(self, x: np.ndarray) -> np.ndarray:
-        return np.ones_like(x)
 
 
 # Mean Squared Error
@@ -153,7 +146,7 @@ class NeuralNet:
     ):
         steps = []
         pairs = []
-        for i, (n_in, n_out) in enumerate(zip(layers, layers[1:])):
+        for i, (n_in, n_out) in enumerate(zip([layers[0]] + layers[:-1], layers)):
             print(f"Creating layer {i} with {n_in} inputs and {n_out} outputs")
             layer = Layer(n_in=n_in, n_out=n_out, seed=seed + i)
             steps.append(layer)
@@ -170,49 +163,27 @@ class NeuralNet:
     def get_layer_activation_pairs(self):
         return self.pairs
 
-
-def testRandom(layers: list[int], seed: int):
-    rng = np.random.default_rng(seed)
-    x = rng.standard_normal(layers[0])        # input activations
-    y_true = rng.standard_normal(layers[-1])  # target activations
-
-    dnn = NeuralNet(layers=layers, seed=seed)
-    y_pred = dnn.forward(x)
-
-    print("input:     ", x)
-    print("target:    ", y_true)
-    print("predicted: ", y_pred)
-
-
-def testXOR(seed: int):
-    layers = [2, 2, 1]
-    dnn = NeuralNet(layers=layers, seed=seed, hidden_activation=Sigmoid, output_activation=Sigmoid)
-    Loss = MSE;
-    for epoch in range(20000):
-        for x, y in [([0, 0], 0), ([0, 1], 1), ([1, 0], 1), ([1, 1], 0)]:
+    
+def train(dnn: NeuralNet, training_data: list[tuple[list[float], float]], Loss, num_epochs: int, learning_rate: float = 0.1, target_loss: float = 0.001):
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        for x, y in training_data:
             x_array = np.array(x)
-            print(f"== Epoch {epoch}, input: {x_array}, target: {y} ==")
             y_pred = dnn.forward(x_array)
             y_true = np.array([y])
-            print(f" * input: {x_array}, target: {y_true} (shape: {y_true.shape}), predicted: {y_pred} (shape: {y_pred.shape})")
             loss = Loss().loss(y_pred, y_true)
-            print(f" * loss: {loss}")
+            epoch_loss += loss
             pairs = dnn.get_layer_activation_pairs()
             # Create a list to hold the deltas for each layer
             deltas = [None] * len(pairs)
-            # print(f" * Layer-Activation pairs: {len(pairs)}")
             for i_reverse, (layer, activation) in enumerate(reversed(pairs)):
                 i = len(pairs) - 1 - i_reverse
-                # print(f" ** Layer {i}: {type(layer).__name__}, Activation: {type(activation).__name__}")
                 if i_reverse == 0:
                     # Last layer
-                    delta = \
-                        Loss().derivative(y_pred, y_true) * \
-                        activation.derivative(layer.last_output)
+                    delta = Loss().derivative(y_pred, y_true) * activation.last_derivative
                 else:
-                    delta = \
-                        (pairs[i + 1].layer.get_weights().T @ deltas[i + 1]) * \
-                        activation.derivative(layer.last_output)
+                    next_weights = pairs[i + 1].layer.get_weights()
+                    delta = (next_weights.T @ deltas[i + 1]) * activation.last_derivative
                 deltas[i] = delta
             # Apply the deltas to update weights and biases
             for i, (layer, activation) in enumerate(pairs):
@@ -222,12 +193,45 @@ def testXOR(seed: int):
                     dloss = np.outer(delta, x_array)
                 else:
                     dloss = np.outer(delta, pairs[i - 1].activation.last_output)
-                # print(f" ** delta at layer {i}: {delta}, gradient at layer {i}: {dloss}")
-                layer.set_weights(layer.get_weights() - 0.1 * dloss)  # simple gradient descent step
-                layer.set_bias(layer.get_bias() - 0.1 * delta)  # update bias
+                layer.set_weights(layer.get_weights() - learning_rate * dloss)  # simple gradient descent step
+                layer.set_bias(layer.get_bias() - learning_rate * delta)  # update bias
+        avg_loss = epoch_loss / len(training_data)
+        if (epoch + 1) % 500 == 0:
+            print(f"Average loss after epoch {epoch + 1}: {avg_loss}")
+        if avg_loss < target_loss:
+            print(f"Training stopped early at epoch {epoch + 1} due to low loss: {avg_loss}")
+            break
+
+
+def check_accuracy(dnn: NeuralNet, test_data: list[tuple[list[float], float]], threshold=0.5):
+    def predict_class(y_pred):
+        return (y_pred >= threshold).astype(int)
+    for x, y in test_data:
+        x_array = np.array(x)
+        y_pred = predict_class(dnn.forward(x_array))
+        print(f"Input: {x_array}, Target: {y}, Predicted: {y_pred}")
+    correct_predictions = sum(predict_class(dnn.forward(np.array(x))) == y for x, y in test_data)
+    accuracy = correct_predictions / len(test_data)
+    return accuracy[0]
+
+
+def print_final_weights_and_biases(dnn: NeuralNet):
+    for i, (layer, activation) in enumerate(dnn.get_layer_activation_pairs()):
+        print(f"Layer {i} weights:\n{layer.get_weights()}")
+        print(f"Layer {i} biases:\n{layer.get_bias()}")
+
+
+def testXOR(seed: int):
+    layers = [2, 1]
+    dnn = NeuralNet(layers=layers, seed=seed, hidden_activation=Sigmoid, output_activation=Sigmoid)
+    Loss = MSE;
+    training_data = [([0, 0], 0), ([0, 1], 1), ([1, 0], 1), ([1, 1], 0)]
+    train(dnn, training_data, Loss, 20000)
+    accuracy = check_accuracy(dnn, training_data)
+    print(f"Final accuracy on XOR problem: {accuracy * 100:.2f}%")
+    print_final_weights_and_biases(dnn)
 
 
 if __name__ == "__main__":
-    # testRandom(layers=[4, 8, 8, 4], seed=42)
     testXOR(seed=42)
 

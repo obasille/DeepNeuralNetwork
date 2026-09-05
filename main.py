@@ -1,7 +1,11 @@
 import random
-from typing import NamedTuple
+from typing import NamedTuple, TypeAlias
 import numpy as np
 import csv
+
+
+Sample: TypeAlias = tuple[list[float], float | list[float]]
+Dataset: TypeAlias = list[Sample]
 
 
 class Neuron:
@@ -174,8 +178,24 @@ class NeuralNet:
     def get_layer_activation_pairs(self):
         return self.pairs
 
+
+def train_test_split(
+    seed: int,
+    data: Dataset,
+    test_size: float = 0.2,
+) -> tuple[Dataset, Dataset]:
+    if not 0 < test_size < 1:
+        raise ValueError("test_size must be between 0 and 1")
+    if len(data) < 2:
+        raise ValueError("data must contain at least two samples")
+
+    shuffled_data = list(data)
+    random.Random(seed).shuffle(shuffled_data)
+    test_count = max(1, round(len(shuffled_data) * test_size))
+    return shuffled_data[test_count:], shuffled_data[:test_count]
+
     
-def train(dnn: NeuralNet, training_data: list[tuple[list[float], float | list[float]]], Loss, seed: int, num_epochs: int = 20000, learning_rate: float = 0.1, target_loss: float = 0.001):
+def train(dnn: NeuralNet, training_data: Dataset, Loss, seed: int, num_epochs: int = 20000, learning_rate: float = 0.1, target_loss: float = 0.001):
     rng = random.Random(seed)
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -220,7 +240,7 @@ def train(dnn: NeuralNet, training_data: list[tuple[list[float], float | list[fl
             break
 
 
-def check_accuracy_XOR(dnn: NeuralNet, test_data: list[tuple[list[float], float | list[float]]], threshold=0.5):
+def check_accuracy_XOR(dnn: NeuralNet, test_data: Dataset, threshold=0.5):
     def predict_class(y_pred):
         return (y_pred >= threshold).astype(int)
     for x, y in test_data:
@@ -232,7 +252,7 @@ def check_accuracy_XOR(dnn: NeuralNet, test_data: list[tuple[list[float], float 
     return accuracy[0]
 
 
-def check_accuracy(dnn: NeuralNet, test_data: list[tuple[list[float], float | list[float]]]):
+def check_accuracy(dnn: NeuralNet, test_data: Dataset):
     correct = 0
     for x, y in test_data:
         x_array = np.array(x)
@@ -299,11 +319,23 @@ def testIris(seed: int):
         )
         for row in iris_data
     ]
+    training_data, test_data = train_test_split(seed, training_data)
     train(dnn, training_data, Loss, seed, learning_rate=0.01)
-    accuracy = check_accuracy(dnn, training_data)
-    print(f"Final accuracy on Iris problem: {accuracy * 100:.2f}%")
+    accuracy_training = check_accuracy(dnn, training_data)
+    accuracy_test = check_accuracy(dnn, test_data)
+    print(f"Final accuracy on Iris problem: training={accuracy_training * 100:.2f}%, test={accuracy_test * 100:.2f}%")
     # print_final_weights_and_biases(dnn)
 
+    # Confusion happens because of versicolor and virginica overlap in feature space
+    from collections import Counter
+    confusions = Counter()
+    for x, y in test_data:
+        y_pred = dnn.forward(np.array(x))
+        predicted_class = np.argmax(y_pred)
+        true_class = np.argmax(y) if isinstance(y, list) else int(y)
+        if predicted_class != true_class:
+            confusions[(true_class, predicted_class)] += 1
+    print(confusions)
 
 if __name__ == "__main__":
     testIris(seed=42)
